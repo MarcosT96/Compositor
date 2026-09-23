@@ -37,6 +37,14 @@ Skills are markdown editing recipes stored in `~/.compositor/skills/<id>/SKILL.m
 
 Three complete [example skills](examples/skills) ship with this document — `skin-retouch`, `product-composite` and `film-look`. Copy their folders into `~/.compositor/skills/`, or have the agent install one with `manage_skills` `action: "create"`.
 
+## Image generation
+
+Generation is bring-your-own-key: `generate_image` calls the provider with an API key the user stores through `manage_credentials` (kept in the macOS Keychain; keys are set and removed but never returned to any client). `list_models` reports the catalog — GPT Image 1, Nano Banana and Nano Banana Pro — and which providers are configured; `provider/model` passthrough reaches newer upstream models on the same backends.
+
+`generate_image` is fire-and-forget. It returns `job_id` immediately and puts a placeholder layer where the result will land, so the person using the app sees the work coming. When the provider answers, the generated image swaps in for the placeholder as **one undo step**. Poll `manage_generations` (`action: "status"`) — never block or busy-wait on the generation itself. A job whose document closed mid-flight keeps its bytes and serves `image_data` exactly once; `action: "cancel"` stops an in-flight job and removes its placeholder.
+
+Generation spends the user's provider credits: write precise, complete prompts, reuse a listed `model`, and generate once per direction instead of sampling unprompted variations. `aspect_ratio` defaults to `1:1`; OpenAI maps it to its three supported sizes and older Gemini endpoints ignore it.
+
 ## HTML/CSS designs
 
 `import_html` accepts `html`, optional `css`, `width`, `height`, and an optional `name`. It creates a new visible tab without replacing the current document. Supply self-contained markup with data URLs for images and fonts. Author JavaScript, external network requests and local file URLs are disabled.
@@ -92,7 +100,7 @@ The transport tests in `CompositorTests/MCPTransportTests.swift` run the real HT
 
 ## Tool coverage
 
-The server advertises 30 tools. Each tool has a JSON schema; `get_capabilities` returns the app's enum values and complete default models for adjustments, effects and filters. Use those values instead of guessing parameter names.
+The server advertises 34 tools. Each tool has a JSON schema; `get_capabilities` returns the app's enum values and complete default models for adjustments, effects and filters. Use those values instead of guessing parameter names.
 
 | Area | Tools |
 | --- | --- |
@@ -104,6 +112,7 @@ The server advertises 30 tools. Each tool has a JSON schema; `get_capabilities` 
 | Canvas and selection | `canvas_operation`, `guide_operation`, `selection_operation`, `sample_selection` |
 | Collaboration | `history_operation`, `settings_operation` |
 | Skills | `read_skill`, `manage_skills` |
+| Generation | `list_models`, `generate_image`, `manage_generations`, `manage_credentials` |
 
 `read_project_data` exposes the entire native editable project, including original layer and mask pixels, text, shapes, effects, adjustments, guide and canvas metadata. `open_project_data` validates and imports that format into a new tab.
 

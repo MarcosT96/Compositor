@@ -1034,7 +1034,7 @@ final class EditorAutomation {
     private static let minimumShortIDPrefix = 4
     private static let idKeys: Set<String> = ["id", "document_id", "selected_document_id", "active_layer_id",
         "layer_id", "layer_ids", "parent_id", "above_id", "source_id", "mask_source_id", "selected_layer_ids",
-        "guide_id", "new_document_ids", "closed_document_ids", "removed_layer_ids"]
+        "guide_id", "new_document_ids", "closed_document_ids", "removed_layer_ids", "placeholder_layer_id"]
 
     /// Every id an agent can name: tabs, layers (including groups and adjustment layers) and guides,
     /// plus ids removed by recent mutations so deltas report deletions with the same short form the

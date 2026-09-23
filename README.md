@@ -84,4 +84,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Agent connection (MCP)
 
-Compositor can expose an opt-in MCP endpoint for AI agents. Agents connect over standard MCP (loopback HTTP) and edit the live editor: native documents, layers and masks, painting, adjustments, selections, HTML/CSS import, and more. See [setup, tools, examples, and limits](docs/mcp.md).
+Compositor can expose an opt-in MCP endpoint for AI agents. Agents connect over standard MCP (loopback HTTP) and edit the live editor: native documents, layers and masks, painting, adjustments, selections, HTML/CSS import, editable skills, and BYOK image generation with pollable jobs. See [setup, tools, examples, and limits](docs/mcp.md).

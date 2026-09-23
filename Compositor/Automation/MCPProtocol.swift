@@ -19,12 +19,14 @@ final class MCPRouter {
     let workspace: ProjectWorkspace
     let editor: EditorAutomation
     let skills: SkillStore
+    let generation: GenerationService
     private var running = false
     private var htmlSources: [UUID: [String: String]] = [:]
-    init(workspace: ProjectWorkspace, skills: SkillStore? = nil) {
+    init(workspace: ProjectWorkspace, skills: SkillStore? = nil, generation: GenerationService? = nil) {
         self.workspace = workspace
         self.editor = EditorAutomation(workspace: workspace)
         self.skills = skills ?? SkillStore()
+        self.generation = generation ?? GenerationService(workspace: workspace)
     }
     var tools: [[String: Any]] {
         editor.tools + [
@@ -42,7 +44,33 @@ final class MCPRouter {
                   "id": ["type": "string", "maxLength": 64],
                   "markdown": ["type": "string", "maxLength": SkillParser.maximumMarkdownBytes]],
                 "required": ["action"]],
-              "annotations": ["readOnlyHint": false, "destructiveHint": true, "openWorldHint": false]]
+              "annotations": ["readOnlyHint": false, "destructiveHint": true, "openWorldHint": false]],
+            ["name": "list_models", "description": "List image-generation models and which providers have an API key configured. Read this before generate_image and use one of the returned ids; provider/model passthrough also works for newer models.",
+              "inputSchema": ["type": "object", "additionalProperties": false, "properties": [String: Any]()],
+              "annotations": ["readOnlyHint": true, "destructiveHint": false, "openWorldHint": false]],
+            ["name": "generate_image", "description": "Generate an image from a text prompt and place it as a new editable layer. Fire-and-forget: returns a job immediately while the user's own provider key pays for it. A placeholder layer marks where the result lands; poll manage_generations for the result and never block on this call. Costs the user money, so write precise, complete prompts and reuse a listed model id.",
+              "inputSchema": ["type": "object", "additionalProperties": false,
+                "properties": ["prompt": ["type": "string", "maxLength": 4_000],
+                  "model": ["type": "string", "maxLength": 200],
+                  "aspect_ratio": ["type": "string", "enum": GenerationCatalog.aspectRatios],
+                  "document_id": ["type": "string", "maxLength": 64],
+                  "x": ["type": "number"], "y": ["type": "number"],
+                  "name": ["type": "string", "maxLength": 64]],
+                "required": ["prompt", "model"]],
+              "annotations": ["readOnlyHint": false, "destructiveHint": false, "openWorldHint": true]],
+            ["name": "manage_generations", "description": "List, inspect, or cancel image-generation jobs. Poll action status with job_id after generate_image instead of blocking; succeeded jobs report layer_id, and a job whose document closed serves its image_data exactly once.",
+              "inputSchema": ["type": "object", "additionalProperties": false,
+                "properties": ["action": ["type": "string", "enum": ["list", "status", "cancel"]],
+                  "job_id": ["type": "integer", "minimum": 1]],
+                "required": ["action"]],
+              "annotations": ["readOnlyHint": false, "destructiveHint": false, "openWorldHint": false]],
+            ["name": "manage_credentials", "description": "Store, report, or remove the user's provider API keys in the macOS Keychain. Keys can be set and removed but are never returned, so have the user supply the key themselves. status only reports whether a provider is configured.",
+              "inputSchema": ["type": "object", "additionalProperties": false,
+                "properties": ["action": ["type": "string", "enum": ["set", "status", "remove"]],
+                  "provider": ["type": "string", "enum": GenerationCatalog.providers],
+                  "api_key": ["type": "string", "maxLength": 512]],
+                "required": ["action", "provider"]],
+              "annotations": ["readOnlyHint": false, "destructiveHint": false, "openWorldHint": false]]
         ]
     }
     func handle(_ request: [String: Any]) async -> [String: Any]? {
@@ -64,7 +92,7 @@ final class MCPRouter {
                 result = ["protocolVersion": versions.contains(requested) ? requested : versions[0],
                           "capabilities": ["tools": ["listChanged": false], "resources": ["subscribe": false, "listChanged": false]],
                           "serverInfo": ["name": "compositor", "version": "1.0.0"],
-                          "instructions": "Edits apply to live Compositor tabs and use native undo. Read list_documents/describe_document before editing. Mutations answer with a delta in describe_document vocabulary; patch your model from it instead of re-reading. Ids are short unique prefixes that any longer prefix or full UUID also matches. Use document_id explicitly. Busy tools fail rather than interrupting a human edit. import_html creates a new tab. Read compositor://guide for details." + skillsSection()]
+                          "instructions": "Edits apply to live Compositor tabs and use native undo. Read list_documents/describe_document before editing. Mutations answer with a delta in describe_document vocabulary; patch your model from it instead of re-reading. Ids are short unique prefixes that any longer prefix or full UUID also matches. Use document_id explicitly. Busy tools fail rather than interrupting a human edit. Image generation is BYOK through manage_credentials; generate_image returns a job immediately and places the result as one undo step, so poll manage_generations instead of blocking. import_html creates a new tab. Read compositor://guide for details." + skillsSection()]
             case "ping": result = [:]
             case "tools/list": result = ["tools": tools]
             case "tools/call":
@@ -81,6 +109,10 @@ final class MCPRouter {
                     if name == "import_html" { result = try await importHTML(args) }
                     else if name == "read_skill" { result = try readSkill(args) }
                     else if name == "manage_skills" { result = try manageSkills(args) }
+                    else if name == "list_models" { result = listModels() }
+                    else if name == "generate_image" { result = try generateImage(args) }
+                    else if name == "manage_generations" { result = try manageGenerations(args) }
+                    else if name == "manage_credentials" { result = try manageCredentials(args) }
                     else { result = try await editor.call(name, arguments: args) }
                 } catch { result = Self.toolError(error.localizedDescription) }
             case "resources/list":
@@ -146,6 +178,81 @@ final class MCPRouter {
         guard let installed = try? skills.index(), !installed.isEmpty else { return "" }
         let lines = installed.prefix(20).map { "\($0.id): \($0.description)" }.joined(separator: "\n")
         return "\n\nSkills are markdown editing recipes stored in ~/.compositor/skills. read_skill(id) loads one before a multi-step edit; manage_skills lists, creates, updates, and removes them. Installed skills:\n\(lines)"
+    }
+
+    // MARK: - Image generation
+
+    private func listModels() -> [String: Any] {
+        var configured: [String: Any] = [:]
+        for provider in GenerationCatalog.providers { configured[provider] = generation.configured(provider) }
+        let ready = GenerationCatalog.providers.filter { generation.configured($0) }.count
+        return ["content": [["type": "text", "text": "\(GenerationCatalog.models.count) models; \(ready) of \(GenerationCatalog.providers.count) providers configured."]],
+            "structuredContent": ["models": GenerationCatalog.models.map(\.summary), "configured": configured]]
+    }
+
+    private func generateImage(_ args: [String: Any]) throws -> [String: Any] {
+        let args = try editor.expandIDs(args)
+        let prompt = (args["prompt"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty, prompt.utf8.count <= 4_000 else { throw RPCError.invalidParams("prompt must be 1-4000 characters") }
+        guard let model = args["model"] as? String, !model.isEmpty else { throw RPCError.invalidParams("model is required; see list_models") }
+        let aspect = args["aspect_ratio"] as? String ?? "1:1"
+        guard GenerationCatalog.aspectRatios.contains(aspect) else { throw RPCError.invalidParams("Unsupported aspect_ratio \(aspect)") }
+        var documentID: UUID?
+        if let value = args["document_id"], !(value is NSNull) { documentID = try editor.resolve(value) }
+        if (args["x"] == nil) != (args["y"] == nil) { throw RPCError.invalidParams("x and y must be provided together") }
+        var point: CGPoint?
+        if let x = number(args["x"]), let y = number(args["y"]) { point = CGPoint(x: x, y: y) }
+        let job = try generation.submit(prompt: prompt, model: model, aspectRatio: aspect,
+            layerName: args["name"] as? String, documentID: documentID, at: point)
+        return ["content": [["type": "text", "text": "Generation started as job \(job.number). Poll manage_generations; do not block on this call."]],
+            "structuredContent": editor.presented(job.summary(includeImage: false))]
+    }
+
+    private func manageGenerations(_ args: [String: Any]) throws -> [String: Any] {
+        guard let action = args["action"] as? String else { throw RPCError.invalidParams("action is required") }
+        switch action {
+        case "list":
+            let jobs = generation.summaries()
+            return ["content": [["type": "text", "text": "\(jobs.count) jobs."]], "structuredContent": editor.presented(["jobs": jobs])]
+        case "status", "cancel":
+            guard let number = args["job_id"] as? Int ?? (args["job_id"] as? NSNumber)?.intValue else {
+                throw RPCError.invalidParams("\(action) needs job_id")
+            }
+            if action == "cancel" {
+                try generation.cancel(number)
+                return ["content": [["type": "text", "text": "Cancelled job \(number)."]], "structuredContent": ["job_id": number, "state": "cancelled"]]
+            }
+            // The receipt serves unplaced bytes exactly once.
+            return ["content": [["type": "text", "text": "Job \(number)."]], "structuredContent": editor.presented(generation.receipt(number))]
+        default: throw RPCError.invalidParams("Unknown action \(action)")
+        }
+    }
+
+    private func manageCredentials(_ args: [String: Any]) throws -> [String: Any] {
+        guard let action = args["action"] as? String, let provider = args["provider"] as? String,
+              GenerationCatalog.providers.contains(provider) else {
+            throw RPCError.invalidParams("action and a supported provider are required")
+        }
+        switch action {
+        case "set":
+            guard let key = args["api_key"] as? String, (8...512).contains(key.utf8.count) else {
+                throw RPCError.invalidParams("set needs api_key (8-512 characters)")
+            }
+            try generation.setKey(key, provider: provider)
+            return ["content": [["type": "text", "text": "Stored the \(provider) key in the Keychain."]], "structuredContent": ["provider": provider, "configured": true]]
+        case "status":
+            let configured = generation.configured(provider)
+            return ["content": [["type": "text", "text": "The \(provider) key \(configured ? "is" : "is not") configured."]], "structuredContent": ["provider": provider, "configured": configured]]
+        case "remove":
+            generation.removeKey(provider)
+            return ["content": [["type": "text", "text": "Removed the \(provider) key."]], "structuredContent": ["provider": provider, "configured": false]]
+        default: throw RPCError.invalidParams("Unknown action \(action)")
+        }
+    }
+
+    private func number(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        return number.doubleValue
     }
 
     private func importHTML(_ args: [String: Any]) async throws -> [String: Any] {
