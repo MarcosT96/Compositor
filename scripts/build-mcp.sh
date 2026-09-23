@@ -7,8 +7,7 @@ build_root="${COMPOSITOR_BUILD_DIR:-$repo_root/build}"
 # Notarized distribution should use a real signing team and the project's hardened Release settings.
 xcodebuild -project "$repo_root/Compositor.xcodeproj" -scheme Compositor \
   -configuration Release -derivedDataPath "$build_root" \
-  CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= ENABLE_HARDENED_RUNTIME=NO \
-  EXCLUDED_SOURCE_FILE_NAMES='*.pyc __pycache__' build
+  CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= ENABLE_HARDENED_RUNTIME=NO build
 app_source="$build_root/Build/Products/Release/Compositor.app"
 if [[ "${1:-}" == "--install" ]]; then
   app_destination="${2:-$HOME/Applications/Compositor MCP.app}"

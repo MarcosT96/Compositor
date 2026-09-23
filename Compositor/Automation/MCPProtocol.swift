@@ -12,8 +12,8 @@ struct RPCError: Error, LocalizedError {
     static func methodNotFound(_ message: String) -> RPCError { .init(code: -32601, message: message) }
 }
 
-/// MCP is transported over stdio by the small bundled bridge. This router lives in the
-/// GUI process so every tool reads and edits the same sessions as the human user.
+/// MCP reaches this router over the loopback HTTP endpoint in `MCPHTTPServer`. The router lives in
+/// the GUI process so every tool reads and edits the same sessions as the human user.
 @MainActor
 final class MCPRouter {
     let workspace: ProjectWorkspace

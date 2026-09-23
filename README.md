@@ -84,4 +84,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Agent connection (MCP)
 
-This branch integrates an opt-in MCP server with the live editor. Agents can read and edit native documents, composite layers and masks, and import HTML/CSS into new editable tabs. See [setup, tools, examples, and limits](docs/mcp.md).
+Compositor can expose an opt-in MCP endpoint for AI agents. Agents connect over standard MCP (loopback HTTP) and edit the live editor: native documents, layers and masks, painting, adjustments, selections, HTML/CSS import, and more. See [setup, tools, examples, and limits](docs/mcp.md).

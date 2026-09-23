@@ -1,140 +1,145 @@
 import AppKit
 import Observation
-@preconcurrency import Network
 
-/// Loopback-only authenticated rendezvous for the stdio bridge. This private wire
-/// is deliberately not an HTTP endpoint (web pages cannot invoke editor commands).
+/// Lifecycle, configuration and client setup for the opt-in MCP endpoint. The HTTP transport is
+/// started and stopped from the app menu; **Copy MCP Configuration** puts the endpoint URL (which
+/// carries the access token) on the pasteboard for the client's MCP settings.
+///
+/// The token lives in an owner-only rendezvous file so a client can be configured once and keep
+/// working across relaunches. Explicitly turning the connection off removes the file and rotates
+/// the token, revoking every configured client at once.
 @MainActor @Observable
 final class AutomationService {
     private(set) var isEnabled = false
     private(set) var status = "Disabled"
-    @ObservationIgnored private var listener: NWListener?
-    @ObservationIgnored private var connections: [UUID: NWConnection] = [:]
-    @ObservationIgnored private var requestTasks: [UUID: Task<Void, Never>] = [:]
-    @ObservationIgnored private var router: MCPRouter
+    @ObservationIgnored private var server: MCPHTTPServer?
+    @ObservationIgnored private let router: MCPRouter
+    @ObservationIgnored private let preferredPort: UInt16
+    @ObservationIgnored private let maximumBytes: Int
+    @ObservationIgnored private(set) var clientURL: URL?
     @ObservationIgnored private var token = ""
-    @ObservationIgnored private var generation = UUID()
-    static let maximumBytes = 40 * 1024 * 1024
-    static let maximumConnections = 4
+
+    /// Well-known default so the copied client configuration stays valid across launches. The
+    /// server falls back to an ephemeral port when another process owns this one.
+    static let defaultPort: UInt16 = 27_892
+
     static var endpointURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Compositor/automation.json")
     }
-    init(workspace: ProjectWorkspace) { router = MCPRouter(workspace: workspace) }
+
+    /// Passing `preferredPort: 0` binds an ephemeral port; tests use that to avoid conflicts.
+    init(workspace: ProjectWorkspace, preferredPort: UInt16? = nil,
+         maximumBytes: Int = MCPHTTPServer.defaultMaximumBytes) {
+        router = MCPRouter(workspace: workspace)
+        if let preferredPort {
+            self.preferredPort = preferredPort
+        } else {
+            let stored = UInt16(clamping: UserDefaults.standard.integer(forKey: "CompositorAutomationPort"))
+            self.preferredPort = stored == 0 ? Self.defaultPort : stored
+        }
+        self.maximumBytes = maximumBytes
+    }
+
     func restore() {
-        guard NSClassFromString("XCTestCase") == nil, ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
-        if UserDefaults.standard.bool(forKey: "CompositorAutomationEnabled") || ProcessInfo.processInfo.arguments.contains("--enable-automation") { start() }
+        guard !Self.isTestHost else { return }
+        if UserDefaults.standard.bool(forKey: "CompositorAutomationEnabled") || ProcessInfo.processInfo.arguments.contains("--enable-automation") {
+            Task { await start() }
+        }
     }
-    func start() {
-        guard listener == nil else { return }
+
+    func start() async {
+        guard server == nil else { return }
+        if token.isEmpty { token = loadOrCreateToken() }
+        let server = MCPHTTPServer(token: token, maximumBytes: maximumBytes) { [router] request in
+            await router.handle(request)
+        }
+        self.server = server
+        status = "Starting…"
         do {
-            let parameters = NWParameters.tcp
-            parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
-            let listener = try NWListener(using: parameters)
-            let epoch = UUID()
-            generation = epoch
-            token = UUID().uuidString + UUID().uuidString
-            self.listener = listener
+            try await server.start(preferredPort: preferredPort)
+            let url = URL(string: "http://127.0.0.1:\(server.port)/mcp/\(token)")!
+            clientURL = url
             isEnabled = true
-            status = "Starting…"
-            UserDefaults.standard.set(true, forKey: "CompositorAutomationEnabled")
-            listener.stateUpdateHandler = { [weak self, weak listener] state in
-                Task { @MainActor [weak self, weak listener] in
-                    guard let self, self.generation == epoch else { return }
-                    switch state {
-                    case .ready:
-                        guard let port = listener?.port else { self.fail("No local port assigned"); return }
-                        do {
-                            let url = Self.endpointURL
-                            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                            let data = try JSONSerialization.data(withJSONObject: ["port": Int(port.rawValue), "token": self.token, "pid": ProcessInfo.processInfo.processIdentifier, "protocol": 1])
-                            // Restrictive permissions apply before credentials are written.
-                            let temporary = url.deletingLastPathComponent().appendingPathComponent(".endpoint-\(epoch)")
-                            guard FileManager.default.createFile(atPath: temporary.path, contents: nil, attributes: [.posixPermissions: 0o600]) else { throw CocoaError(.fileWriteUnknown) }
-                            try data.write(to: temporary)
-                            if rename(temporary.path, url.path) != 0 { try? FileManager.default.removeItem(at: temporary); throw CocoaError(.fileWriteUnknown) }
-                            self.status = "Connected locally · port \(port.rawValue)"
-                        } catch { self.fail(error.localizedDescription) }
-                    case .failed(let error): self.fail(error.localizedDescription)
-                    default: break
-                    }
-                }
-            }
-            listener.newConnectionHandler = { [weak self] connection in
-                Task { @MainActor [weak self] in
-                    guard let self, self.generation == epoch, self.connections.count < Self.maximumConnections else { connection.cancel(); return }
-                    let id = UUID()
-                    self.connections[id] = connection
-                    connection.start(queue: .main)
-                    self.receive(connection, id: id, data: Data())
-                    Task { @MainActor [weak self] in
-                        try? await Task.sleep(for: .seconds(120))
-                        self?.finish(id)
-                    }
-                }
-            }
-            listener.start(queue: .main)
-        } catch { fail(error.localizedDescription) }
+            setEnabled(true)
+            if !Self.isTestHost { try writeEndpoint(url: url, port: server.port) }
+            status = "Listening · port \(server.port)"
+        } catch {
+            stop(revoke: false)
+            status = "Connection error: \(error.localizedDescription)"
+        }
     }
-    func stop() {
-        generation = UUID()
-        listener?.cancel(); listener = nil
-        for task in requestTasks.values { task.cancel() }
-        requestTasks.removeAll()
-        for connection in connections.values { connection.cancel() }
-        connections.removeAll()
-        // Do not remove a rendezvous file owned by a different app process.
-        if let data = try? Data(contentsOf: Self.endpointURL), let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], object["token"] as? String == token { try? FileManager.default.removeItem(at: Self.endpointURL) }
-        token = ""; isEnabled = false; status = "Disabled"
-        UserDefaults.standard.set(false, forKey: "CompositorAutomationEnabled")
+
+    /// `revoke: true` (the menu toggle) rotates the token so no previously configured client can
+    /// reconnect. Lifecycle shutdowns keep it, which is what makes client configuration durable.
+    func stop(revoke: Bool = false) {
+        server?.stop()
+        server = nil
+        clientURL = nil
+        isEnabled = false
+        status = "Disabled"
+        setEnabled(false)
+        if revoke {
+            token = ""
+            if !Self.isTestHost { try? FileManager.default.removeItem(at: Self.endpointURL) }
+        }
     }
+
     func shutdown() {
         let restoreOnLaunch = isEnabled
-        stop()
-        UserDefaults.standard.set(restoreOnLaunch, forKey: "CompositorAutomationEnabled")
+        server?.stop()
+        server = nil
+        clientURL = nil
+        isEnabled = false
+        setEnabled(restoreOnLaunch)
     }
-    private func fail(_ message: String) { stop(); status = "Connection error: \(message)" }
-    private func finish(_ id: UUID) {
-        requestTasks.removeValue(forKey: id)?.cancel()
-        connections.removeValue(forKey: id)?.cancel()
-    }
-    private func receive(_ connection: NWConnection, id: UUID, data: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] chunk, _, complete, error in
-            Task { @MainActor [weak self] in
-                guard let self, self.connections[id] != nil else { return }
-                var buffer = data
-                if let chunk { buffer.append(chunk) }
-                guard buffer.count <= Self.maximumBytes else { self.finish(id); return }
-                if let end = buffer.firstIndex(of: 10) {
-                    guard buffer.index(after: end) == buffer.endIndex,
-                          let object = try? JSONSerialization.jsonObject(with: buffer[..<end]) as? [String: Any],
-                          let supplied = object["token"] as? String, self.matchesToken(supplied),
-                          let request = object["request"] as? [String: Any] else { self.finish(id); return }
-                    let task = Task { @MainActor [weak self] in
-                        guard let self, self.connections[id] != nil, !Task.isCancelled else { return }
-                        let response = await self.router.handle(request)
-                        guard self.connections[id] != nil, !Task.isCancelled else { return }
-                        let envelope: [String: Any] = ["response": response as Any? ?? NSNull()]
-                        guard var bytes = try? JSONSerialization.data(withJSONObject: envelope), bytes.count <= Self.maximumBytes else { self.finish(id); return }
-                        bytes.append(10)
-                        connection.send(content: bytes, completion: .contentProcessed { [weak self] _ in Task { @MainActor [weak self] in self?.finish(id) } })
-                    }
-                    self.requestTasks[id] = task
-                } else if complete || error != nil { self.finish(id) }
-                else { self.receive(connection, id: id, data: buffer) }
-            }
-        }
-    }
-    private func matchesToken(_ supplied: String) -> Bool {
-        let a = Array(supplied.utf8), b = Array(token.utf8)
-        guard a.count == b.count, !b.isEmpty else { return false }
-        return zip(a, b).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
-    }
+
     func copyConfiguration() {
-        guard let script = Bundle.main.url(forResource: "compositor-mcp", withExtension: "py") else { status = "Bridge resource missing from this build"; return }
-        let config: [String: Any] = ["mcpServers": ["compositor": ["command": "/usr/bin/python3", "args": [script.path, "--endpoint", Self.endpointURL.path]]]]
-        if let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys]), let text = String(data: data, encoding: .utf8) {
-            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+        guard let url = clientURL else { return }
+        let config: [String: Any] = ["mcpServers": ["compositor": ["url": url.absoluteString]]]
+        if let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys]),
+           let text = String(data: data, encoding: .utf8) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
         }
+    }
+
+    private func setEnabled(_ enabled: Bool) {
+        guard !Self.isTestHost else { return }
+        UserDefaults.standard.set(enabled, forKey: "CompositorAutomationEnabled")
+    }
+
+    private func loadOrCreateToken() -> String {
+        if let data = try? Data(contentsOf: Self.endpointURL),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let stored = object["token"] as? String, stored.utf8.count >= 32 {
+            return stored
+        }
+        return UUID().uuidString + UUID().uuidString
+    }
+
+    private func writeEndpoint(url: URL, port: UInt16) throws {
+        let file = Self.endpointURL
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(),
+            withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let data = try JSONSerialization.data(withJSONObject: [
+            "url": url.absoluteString, "port": Int(port), "token": token,
+            "pid": ProcessInfo.processInfo.processIdentifier, "protocol": 2
+        ])
+        // Restrictive permissions apply before credentials are written.
+        let temporary = file.deletingLastPathComponent().appendingPathComponent(".endpoint-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: temporary.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try data.write(to: temporary)
+        if rename(temporary.path, file.path) != 0 {
+            try? FileManager.default.removeItem(at: temporary)
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
+    /// Unit tests run inside the app; persistence would clobber the user's real endpoint file.
+    private static var isTestHost: Bool {
+        NSClassFromString("XCTestCase") != nil || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     }
 }

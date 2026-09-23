@@ -86,7 +86,8 @@ struct CompositorApp: App {
                     CommandGroup(after: .appSettings) {
                         Menu("Agent Connection") {
                             Toggle("Enable MCP", isOn: Binding(get: { applicationDelegate.automation.isEnabled }, set: { enabled in
-                                if enabled { applicationDelegate.automation.start() } else { applicationDelegate.automation.stop() }
+                                if enabled { Task { await applicationDelegate.automation.start() } }
+                                else { applicationDelegate.automation.stop(revoke: true) }
                             }))
                             Text(applicationDelegate.automation.status)
                             Button("Copy MCP Configuration") { applicationDelegate.automation.copyConfiguration() }

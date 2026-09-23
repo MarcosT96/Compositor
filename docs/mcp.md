@@ -1,20 +1,33 @@
 # Compositor agent connection
 
-The MCP server runs **inside Compositor** and edits the same tabs, layers, selections and history as the person using the app. A small Python stdio bridge connects MCP clients to the running app. Python has no third-party runtime dependencies.
+The MCP server runs **inside Compositor** and edits the same tabs, layers, selections and history as the person using the app. It speaks standard MCP over a loopback HTTP endpoint, so Claude Code, Codex, Cursor and any other streamable-HTTP client connect directly — there is no external runtime or bridge process.
 
 ## Connect
 
 1. Build and open this version of Compositor.
 2. In **Compositor → Agent Connection**, enable **MCP**.
-3. Choose **Copy MCP Configuration** and add the copied entry to your client's MCP configuration.
+3. Choose **Copy MCP Configuration** and add the copied entry to your client's MCP configuration. The endpoint URL contains the access token, so the copied configuration keeps working across app relaunches.
 
-The menu shows connection status. Turning the connection off closes clients, invalidates their token, and cancels pending work. Edits already committed remain in native undo history. Keep the app open while using its tools.
+```sh
+# Claude Code
+claude mcp add --transport http compositor http://127.0.0.1:27892/mcp/<token>
+# Codex
+codex mcp add compositor --url http://127.0.0.1:27892/mcp/<token>
+```
+
+Cursor reads the same URL from `~/.cursor/mcp.json`:
+
+```json
+{ "mcpServers": { "compositor": { "url": "http://127.0.0.1:27892/mcp/<token>" } } }
+```
+
+The menu shows connection status. Turning the connection off closes clients and rotates the access token, so previously copied configurations stop working until copied again. Edits already committed remain in native undo history. Keep the app open while using its tools.
 
 ## Collaboration
 
 List documents first. Keep the returned `document_id` and pass it on subsequent calls, rather than relying on whichever tab is selected. Read the current document before modifying it. Mutation tools accept an `expected_revision` so stale edits can be rejected. Agent calls also reject active human editing operations; finish or cancel the gesture/dialog and retry.
 
-Edits use the app's native undo history. Tools report validation and execution failures with `isError`; protocol errors use JSON-RPC errors. A transport disconnect is not proof that a mutation failed: read state before retrying.
+Edits use the app's native undo history. Tools report validation and execution failures with `isError`; protocol errors use JSON-RPC errors. A transport disconnect is not proof that a mutation failed: read state before retrying. `notifications/cancelled` interrupts an in-flight call at its next checkpoint; committed edits stay undoable.
 
 ## HTML/CSS designs
 
@@ -28,11 +41,22 @@ A complete [960 × 640 example](examples/agent-layout.html) imports as 11 layers
 
 ![HTML layout imported into native Compositor layers](examples/agent-layout.png)
 
+## Files and the sandbox
+
+Compositor keeps its macOS sandbox, so the tools move image and project **bytes** and the agent does the filesystem work with its own file access:
+
+- **Import an image or PSD**: read the file, base64-encode it, and pass it to `import_image` with a `filename` carrying a supported extension (`.png`, `.jpg`, `.jpeg`, `.heic`, `.tif`, `.tiff`, `.psd`).
+- **Export the finished image**: `render_document` returns base64 PNG at full canvas resolution; decode and write it wherever the deliverable belongs.
+- **Save an editable project**: `read_project_data` returns a base64 envelope which, decoded, is `{"format": "com.compositor.mcp-project", "manifest": <base64 manifest.json>, "images": {"<uuid>[.mask].png": <base64>, …}}`. Write the decoded `manifest.json` and an `images/` directory beside it inside a directory named `<name>.comp`, and the native loader opens that package like any Compositor project.
+- **Reopen a project**: read a `.comp` package's `manifest.json` and `images/`, rebuild that envelope, and pass it to `open_project_data`. The project opens in a new tab.
+
+Images and self-contained project envelopes are limited to 24 MiB each; a manifest is limited to 4 MiB. Large production projects can still be edited in the GUI, but may exceed the current MCP transfer budget. Render previews default to a 1600-pixel longest edge; request `max_dimension: 0` for full resolution.
+
 ## Transport and security
 
-The application retains its macOS sandbox. The private bridge binds only to `127.0.0.1` on an ephemeral port. Its random per-start token is stored in an owner-only application-support file. The bridge checks ownership and permissions, and the app authenticates every request. The rendezvous file lives in the app's sandbox container when sandboxed.
+The application retains its macOS sandbox. The HTTP endpoint binds only to `127.0.0.1` (a well-known port by default, with an ephemeral fallback when it is taken). The URL path carries the access token, which is stored in an owner-only application-support file so client configuration survives relaunches; turning the connection off removes the file and rotates the token.
 
-The private wire is one newline-delimited authenticated JSON envelope per TCP connection. It is **not an HTTP endpoint**; MCP clients use the stdio bridge, not this private transport. Requests and responses are limited to 40 MiB. There are no automatic mutation retries. The stdio bridge processes one request at a time and cannot consume client `notifications/cancelled` while waiting on that request. Disable the app connection to cancel pending work; completed edits remain undoable.
+Because a local HTTP endpoint is reachable from any web page that guesses its URL, every request is checked before its body is interpreted: `Origin` and `Host` must name loopback, the path must carry the current token, and an unknown `Mcp-Session-Id` is refused. Bodies are bounded at 40 MiB and parsed strictly; there are no automatic mutation retries. Each request is answered on its own connection and closed. Requests without a session id work statelessly, and `DELETE` tears a session down.
 
 ## Reuse
 
@@ -40,13 +64,12 @@ The JSON-RPC error conventions were adapted from Marcus Horndt's MIT-licensed [c
 
 ## Build and test
 
-Requirements: macOS 26.5 or later and Xcode with the macOS 26.5 SDK or later; Python 3.9 or later for the bundled stdio bridge.
+Requirements: macOS 26.5 or later and Xcode with the macOS 26.5 SDK or later.
 
 ```sh
 ./scripts/build-mcp.sh
 ./scripts/build-mcp.sh --install
 # Optional second argument chooses a different app destination.
-python3 -B scripts/test-mcp-bridge.py -v
 xcodebuild -project Compositor.xcodeproj -scheme Compositor \
   -configuration Debug -derivedDataPath build \
   CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= \
@@ -57,25 +80,23 @@ xcodebuild -project Compositor.xcodeproj -scheme Compositor \
 
 The install command creates `~/Applications/Compositor MCP.app` and refuses to overwrite an existing application. Open it, then enable the connection in the menu. This is a locally signed development build, not a notarized release. The local build script keeps the app sandbox and disables hardened-runtime library validation because ad-hoc signing has no team identity matching the bundled Sparkle framework. Signed distribution should use an Apple development team and the project’s hardened Release settings.
 
+The transport tests in `CompositorTests/MCPTransportTests.swift` run the real HTTP endpoint on an ephemeral port and cover the handshake, tool calls, batching, cancellation and every rejection path.
+
 ## Tool coverage
 
-The server advertises 32 tools. Each tool has a JSON schema; `get_capabilities` returns the app's enum values and complete default models for adjustments, effects and filters. Use those values instead of guessing parameter names.
+The server advertises 28 tools. Each tool has a JSON schema; `get_capabilities` returns the app's enum values and complete default models for adjustments, effects and filters. Use those values instead of guessing parameter names.
 
 | Area | Tools |
 | --- | --- |
 | Discovery and state | `get_capabilities`, `list_documents`, `describe_document`, `get_editor_state` |
-| Documents and project data | `new_document`, `close_document`, `read_project_data`, `open_project_data`, `open_document`, `save_document` |
-| Import and export | `import_html`, `import_image`, `import_image_file`, `render_document`, `export_image` |
+| Documents and project data | `new_document`, `close_document`, `read_project_data`, `open_project_data` |
+| Import and export | `import_html`, `import_image`, `render_document` |
 | Compositing | `layer_operation`, `transform_operation`, `mask_operation`, `adjustment_operation`, `effect_operation` |
 | Drawing and pixels | `text_operation`, `shape_operation`, `paint_stroke`, `gradient_operation`, `pixel_operation`, `filter_operation` |
 | Canvas and selection | `canvas_operation`, `guide_operation`, `selection_operation`, `sample_selection` |
 | Collaboration | `history_operation`, `settings_operation` |
 
-`read_project_data` exposes the entire native editable project, including original layer and mask pixels, text, shapes, effects, adjustments, guide and canvas metadata. `open_project_data` validates and imports that format into a new tab. Direct filesystem tools live in the stdio bridge so the sandboxed GUI does not need broad disk access.
-
-`save_document` writes a native `.comp` project directory using an atomic replacement, with explicit `overwrite: true` required to replace a previous project. It saves a copy; it does not change the sandboxed GUI's Save destination or mark its tab clean. Use the app's Save command if you want subsequent manual saves tied to that path. Export writes PNG at full canvas resolution. Existing output files also require explicit overwrite.
-
-Images and self-contained project envelopes are limited to 24 MiB each; a manifest is limited to 4 MiB. Large production projects can still be edited in the GUI, but may exceed the current MCP file-transfer budget. Render previews default to a 1600-pixel longest edge; request `max_dimension: 0` for full resolution.
+`read_project_data` exposes the entire native editable project, including original layer and mask pixels, text, shapes, effects, adjustments, guide and canvas metadata. `open_project_data` validates and imports that format into a new tab.
 
 ## Examples
 
@@ -105,7 +126,6 @@ Create a selection-based mask:
 
 The HTML importer prioritizes faithful appearance. Supported flat text/shapes remain editable; gradients and embedded assets use isolated raster layers. Unsupported stacking, shadows and transforms may flatten the entire design, with a warning. HTML source is session-only and is not stored in `.comp` projects. Keep the original source alongside the project when future re-import is needed.
 
-
-Layered Photoshop imports use `import_image` with a `.psd` filename and base64 data, or `import_image_file` with an absolute PSD path. The native reader supports 8-bit RGB PSD files, including its supported layer, group, mask and adjustment types. Conversion notes are returned in the tool result: Photoshop text, smart objects and unsupported layer types may become pixels, and unsupported effects may be discarded. Compositor does not write PSD files; preserve the editable result as `.comp`.
+Layered Photoshop imports use `import_image` with a `.psd` filename and base64 data. The native reader supports 8-bit RGB PSD files, including its supported layer, group, mask and adjustment types. Conversion notes are returned in the tool result: Photoshop text, smart objects and unsupported layer types may become pixels, and unsupported effects may be discarded. Compositor does not write PSD files; preserve the editable result as `.comp`.
 
 For an independent mask transform, first use `mask_operation` with `action: "set_linked"` and `linked: false`, then `transform_operation` with `target: "mask"`. `link`/`unlink` instead create or remove a clipping relationship to another source layer. Delete calls reject a source that still has clipping dependents; unlink those dependents first. Filter and transform tools default to the layer target and support an explicit mask target, so a previous human mask selection cannot redirect their edits.
