@@ -27,7 +27,15 @@ The menu shows connection status. Turning the connection off closes clients and 
 
 List documents first. Keep the returned `document_id` and pass it on subsequent calls, rather than relying on whichever tab is selected. Read the current document before modifying it. Mutation tools accept an `expected_revision` so stale edits can be rejected. Agent calls also reject active human editing operations; finish or cancel the gesture/dialog and retry.
 
+Entity ids (documents, layers and guides) are the shortest unique prefix of the underlying UUID — at least eight characters — and any longer prefix or full UUID is accepted back. Mutation tools answer with a **delta** in `describe_document` vocabulary: `changed` names the top-level sections whose values moved, those sections carry their new values, `layers` holds the resulting state of created or edited layers with their top-to-bottom `index`, and `removed_layer_ids` lists deletions. Patch your model from the delta instead of re-reading the document; `layers_note` appears when more than 20 layers changed at once. `new_document_ids` and `closed_document_ids` report tab lifecycle at the top level.
+
 Edits use the app's native undo history. Tools report validation and execution failures with `isError`; protocol errors use JSON-RPC errors. A transport disconnect is not proof that a mutation failed: read state before retrying. `notifications/cancelled` interrupts an in-flight call at its next checkpoint; committed edits stay undoable.
+
+## Skills
+
+Skills are markdown editing recipes stored in `~/.compositor/skills/<id>/SKILL.md`. `initialize` lists installed skills in the server instructions so a matching recipe is found before one is improvised; `read_skill` loads one in full, and `manage_skills` lists, creates, updates and removes them. A skill is a `name` (80 characters) and `description` (1024 characters) frontmatter followed by workflow prose: it suggests tool calls but cannot execute anything by itself.
+
+Three complete [example skills](examples/skills) ship with this document — `skin-retouch`, `product-composite` and `film-look`. Copy their folders into `~/.compositor/skills/`, or have the agent install one with `manage_skills` `action: "create"`.
 
 ## HTML/CSS designs
 
@@ -84,7 +92,7 @@ The transport tests in `CompositorTests/MCPTransportTests.swift` run the real HT
 
 ## Tool coverage
 
-The server advertises 28 tools. Each tool has a JSON schema; `get_capabilities` returns the app's enum values and complete default models for adjustments, effects and filters. Use those values instead of guessing parameter names.
+The server advertises 30 tools. Each tool has a JSON schema; `get_capabilities` returns the app's enum values and complete default models for adjustments, effects and filters. Use those values instead of guessing parameter names.
 
 | Area | Tools |
 | --- | --- |
@@ -95,6 +103,7 @@ The server advertises 28 tools. Each tool has a JSON schema; `get_capabilities` 
 | Drawing and pixels | `text_operation`, `shape_operation`, `paint_stroke`, `gradient_operation`, `pixel_operation`, `filter_operation` |
 | Canvas and selection | `canvas_operation`, `guide_operation`, `selection_operation`, `sample_selection` |
 | Collaboration | `history_operation`, `settings_operation` |
+| Skills | `read_skill`, `manage_skills` |
 
 `read_project_data` exposes the entire native editable project, including original layer and mask pixels, text, shapes, effects, adjustments, guide and canvas metadata. `open_project_data` validates and imports that format into a new tab.
 

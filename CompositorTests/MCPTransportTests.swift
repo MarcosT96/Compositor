@@ -76,8 +76,8 @@ struct MCPTransportTests {
         let json = try reply.json()
         let tools = try #require((json["result"] as? [String: Any])?["tools"] as? [[String: Any]])
         let names = Set(tools.compactMap { $0["name"] as? String })
-        #expect(names.count == 28)
-        for expected in ["layer_operation", "paint_stroke", "render_document", "import_html", "history_operation"] {
+        #expect(names.count == 30)
+        for expected in ["layer_operation", "paint_stroke", "render_document", "import_html", "history_operation", "read_skill", "manage_skills"] {
             #expect(names.contains(expected))
         }
     }

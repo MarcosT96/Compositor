@@ -18,17 +18,32 @@ struct RPCError: Error, LocalizedError {
 final class MCPRouter {
     let workspace: ProjectWorkspace
     let editor: EditorAutomation
+    let skills: SkillStore
     private var running = false
     private var htmlSources: [UUID: [String: String]] = [:]
-    init(workspace: ProjectWorkspace) {
+    init(workspace: ProjectWorkspace, skills: SkillStore? = nil) {
         self.workspace = workspace
         self.editor = EditorAutomation(workspace: workspace)
+        self.skills = skills ?? SkillStore()
     }
     var tools: [[String: Any]] {
-        editor.tools + [["name": "import_html", "description": "Import self-contained HTML/CSS as a NEW visible project tab. Simple text and shapes stay editable; unsupported CSS may be rasterized, with warnings. No page scripts, network or local-file URLs. Embed images/fonts as data URLs. Coordinates are canvas pixels. Returns tab state and conversion warnings.",
-          "inputSchema": ["type": "object", "additionalProperties": false,
-            "properties": ["html": ["type": "string", "maxLength": 2_000_000], "css": ["type": "string", "maxLength": 1_000_000], "name": ["type": "string", "maxLength": 200], "width": ["type": "integer", "minimum": 1, "maximum": 4096], "height": ["type": "integer", "minimum": 1, "maximum": 4096]], "required": ["html", "width", "height"]],
-          "annotations": ["readOnlyHint": false, "destructiveHint": false, "openWorldHint": false]]]
+        editor.tools + [
+            ["name": "import_html", "description": "Import self-contained HTML/CSS as a NEW visible project tab. Simple text and shapes stay editable; unsupported CSS may be rasterized, with warnings. No page scripts, network or local-file URLs. Embed images/fonts as data URLs. Coordinates are canvas pixels. Returns tab state and conversion warnings.",
+              "inputSchema": ["type": "object", "additionalProperties": false,
+                "properties": ["html": ["type": "string", "maxLength": 2_000_000], "css": ["type": "string", "maxLength": 1_000_000], "name": ["type": "string", "maxLength": 200], "width": ["type": "integer", "minimum": 1, "maximum": 4096], "height": ["type": "integer", "minimum": 1, "maximum": 4096]], "required": ["html", "width", "height"]],
+              "annotations": ["readOnlyHint": false, "destructiveHint": false, "openWorldHint": false]],
+            ["name": "read_skill", "description": "Load one complete editing skill before a multi-step edit when its description matches the task. Skills are markdown recipes that suggest tool calls; follow their workflow and verify results as usual.",
+              "inputSchema": ["type": "object", "additionalProperties": false,
+                "properties": ["id": ["type": "string", "maxLength": 64]], "required": ["id"]],
+              "annotations": ["readOnlyHint": true, "destructiveHint": false, "openWorldHint": false]],
+            ["name": "manage_skills", "description": "List, create, update, or remove editing skills stored in ~/.compositor/skills. create and update take complete SKILL.md markdown: a frontmatter with name and description, then a workflow body. Use list before offering to teach the user a new skill.",
+              "inputSchema": ["type": "object", "additionalProperties": false,
+                "properties": ["action": ["type": "string", "enum": ["list", "create", "update", "remove"]],
+                  "id": ["type": "string", "maxLength": 64],
+                  "markdown": ["type": "string", "maxLength": SkillParser.maximumMarkdownBytes]],
+                "required": ["action"]],
+              "annotations": ["readOnlyHint": false, "destructiveHint": true, "openWorldHint": false]]
+        ]
     }
     func handle(_ request: [String: Any]) async -> [String: Any]? {
         let id = request["id"] ?? NSNull()
@@ -49,7 +64,7 @@ final class MCPRouter {
                 result = ["protocolVersion": versions.contains(requested) ? requested : versions[0],
                           "capabilities": ["tools": ["listChanged": false], "resources": ["subscribe": false, "listChanged": false]],
                           "serverInfo": ["name": "compositor", "version": "1.0.0"],
-                          "instructions": "Edits apply to live Compositor tabs and use native undo. Read list_documents/describe_document before editing. Use document_id explicitly. Busy tools fail rather than interrupting a human edit. import_html creates a new tab. Read compositor://guide for details."]
+                          "instructions": "Edits apply to live Compositor tabs and use native undo. Read list_documents/describe_document before editing. Mutations answer with a delta in describe_document vocabulary; patch your model from it instead of re-reading. Ids are short unique prefixes that any longer prefix or full UUID also matches. Use document_id explicitly. Busy tools fail rather than interrupting a human edit. import_html creates a new tab. Read compositor://guide for details." + skillsSection()]
             case "ping": result = [:]
             case "tools/list": result = ["tools": tools]
             case "tools/call":
@@ -64,21 +79,27 @@ final class MCPRouter {
                     try validateArguments(args, tool: name)
                     try Task.checkCancellation()
                     if name == "import_html" { result = try await importHTML(args) }
+                    else if name == "read_skill" { result = try readSkill(args) }
+                    else if name == "manage_skills" { result = try manageSkills(args) }
                     else { result = try await editor.call(name, arguments: args) }
                 } catch { result = Self.toolError(error.localizedDescription) }
             case "resources/list":
-                result = ["resources": [["uri": "compositor://guide", "name": "Agent editing guide", "mimeType": "text/plain"]] + workspace.tabs.map { ["uri": "compositor://documents/\($0.id.uuidString)", "name": $0.title, "mimeType": "application/json"] }]
+                result = ["resources": [["uri": "compositor://guide", "name": "Agent editing guide", "mimeType": "text/plain"]] + workspace.tabs.map { ["uri": "compositor://documents/\(editor.shortID($0.id))", "name": $0.title, "mimeType": "application/json"] }]
             case "resources/templates/list":
                 result = ["resourceTemplates": [["uriTemplate": "compositor://documents/{document_id}", "name": "Live document state", "mimeType": "application/json"], ["uriTemplate": "compositor://html/{document_id}", "name": "Imported HTML/CSS source", "mimeType": "application/json"]]]
             case "resources/read":
                 guard let uri = params["uri"] as? String else { throw RPCError.invalidParams("uri is required") }
                 let value: String
                 if uri == "compositor://guide" {
-                    value = "Compositor live editing: list_documents returns stable tab IDs; pass document_id to tools. describe_document exposes the complete layer manifest. Edits use native history. A busy human session or another request is rejected. All coordinates are document pixels, with origin at top left. Import images as base64 data for sandbox-safe access. HTML import accepts self-contained markup/styles, supports embedded data assets, disables author scripts and external resources, and reports raster fallbacks. Complex browser effects cannot always become native editable layers. Imported HTML source is available for this app session at compositor://html/{document_id}. Save your .comp to preserve the editable document. Disable Agent Connection in the app menu to revoke all clients."
-                } else if uri.hasPrefix("compositor://documents/"), let uuid = UUID(uuidString: String(uri.dropFirst("compositor://documents/".count))), workspace.tabs.contains(where: { $0.id == uuid }) {
+                    value = "Compositor live editing: list_documents returns stable tab IDs; pass document_id to tools. describe_document exposes the complete layer manifest. Mutation tools answer with a delta in describe_document vocabulary: patch your model from it instead of re-reading. Ids are short unique prefixes; any longer prefix or full UUID also matches. Edits use native history. A busy human session or another request is rejected. All coordinates are document pixels, with origin at top left. Import images as base64 data for sandbox-safe access. Skills are markdown editing recipes stored in ~/.compositor/skills; read_skill loads one before a multi-step edit. HTML import accepts self-contained markup/styles, supports embedded data assets, disables author scripts and external resources, and reports raster fallbacks. Complex browser effects cannot always become native editable layers. Imported HTML source is available for this app session at compositor://html/{document_id}. Save your .comp to preserve the editable document. Disable Agent Connection in the app menu to revoke all clients."
+                } else if uri.hasPrefix("compositor://documents/"),
+                          let uuid = try? editor.resolve(String(uri.dropFirst("compositor://documents/".count))),
+                          workspace.tabs.contains(where: { $0.id == uuid }) {
                     let state = try await editor.call("describe_document", arguments: ["document_id": uuid.uuidString])
                     value = String(data: try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]), encoding: .utf8)!
-                } else if uri.hasPrefix("compositor://html/"), let uuid = UUID(uuidString: String(uri.dropFirst("compositor://html/".count))), let source = htmlSources[uuid], workspace.tabs.contains(where: { $0.id == uuid }) {
+                } else if uri.hasPrefix("compositor://html/"),
+                          let uuid = try? editor.resolve(String(uri.dropFirst("compositor://html/".count))),
+                          let source = htmlSources[uuid], workspace.tabs.contains(where: { $0.id == uuid }) {
                     value = String(data: try JSONSerialization.data(withJSONObject: source), encoding: .utf8)!
                 } else { throw RPCError(code: -32002, message: "Resource not found") }
                 result = ["contents": [["uri": uri, "mimeType": uri == "compositor://guide" ? "text/plain" : "application/json", "text": value]]]
@@ -88,6 +109,45 @@ final class MCPRouter {
         } catch let e as RPCError { return error(id, e.code, e.message) }
         catch { return self.error(id, -32603, error.localizedDescription) }
     }
+    private func readSkill(_ args: [String: Any]) throws -> [String: Any] {
+        guard let id = args["id"] as? String else { throw RPCError.invalidParams("id is required") }
+        let skill = try skills.skill(id: id)
+        return ["content": [["type": "text", "text": skill.markdown]], "structuredContent": skill.detail]
+    }
+
+    private func manageSkills(_ args: [String: Any]) throws -> [String: Any] {
+        guard let action = args["action"] as? String else { throw RPCError.invalidParams("action is required") }
+        switch action {
+        case "list":
+            let installed = try skills.index()
+            return ["content": [["type": "text", "text": "\(installed.count) skills installed."]],
+                "structuredContent": ["skills": installed.map(\.summary)]]
+        case "create", "update":
+            guard let id = args["id"] as? String, let markdown = args["markdown"] as? String else {
+                throw RPCError.invalidParams("\(action) needs id and markdown")
+            }
+            let exists = (try? skills.skill(id: id)) != nil
+            if action == "create", exists { throw SkillError.rejected("A skill named \(id) already exists.") }
+            if action == "update", !exists { throw SkillError.rejected("No skill named \(id) is installed.") }
+            let skill = try SkillParser.parse(id: id, markdown: markdown)
+            try skills.save(skill)
+            return ["content": [["type": "text", "text": "\(action == "create" ? "Created" : "Updated") skill \(id)."]], "structuredContent": skill.summary]
+        case "remove":
+            guard let id = args["id"] as? String else { throw RPCError.invalidParams("remove needs id") }
+            try skills.remove(id: id)
+            return ["content": [["type": "text", "text": "Removed skill \(id)."]], "structuredContent": ["id": id]]
+        default:
+            throw RPCError.invalidParams("Unknown action \(action).")
+        }
+    }
+
+    /// Installed skills join the system prompt so the agent knows a recipe exists before guessing.
+    private func skillsSection() -> String {
+        guard let installed = try? skills.index(), !installed.isEmpty else { return "" }
+        let lines = installed.prefix(20).map { "\($0.id): \($0.description)" }.joined(separator: "\n")
+        return "\n\nSkills are markdown editing recipes stored in ~/.compositor/skills. read_skill(id) loads one before a multi-step edit; manage_skills lists, creates, updates, and removes them. Installed skills:\n\(lines)"
+    }
+
     private func importHTML(_ args: [String: Any]) async throws -> [String: Any] {
         try editor.requireWorkspaceReady()
         guard let html = args["html"] as? String, !html.isEmpty,
@@ -110,7 +170,8 @@ final class MCPRouter {
         tab.session.history.end(document: tab.session.document, selection: tab.session.activeLayerID)
         htmlSources = htmlSources.filter { id, _ in workspace.tabs.contains(where: { $0.id == id }) }
         htmlSources[tab.id] = ["html": html, "css": css, "name": name]
-        let info: [String: Any] = ["document_id": tab.id.uuidString, "name": name, "layer_count": imported.snapshot.manifest.layers.count, "warnings": imported.warnings, "source_uri": "compositor://html/\(tab.id.uuidString)"]
+        let documentID = editor.shortID(tab.id)
+        let info: [String: Any] = ["document_id": documentID, "name": name, "layer_count": imported.snapshot.manifest.layers.count, "warnings": imported.warnings, "source_uri": "compositor://html/\(documentID)"]
         return ["content": [["type": "text", "text": String(data: try JSONSerialization.data(withJSONObject: info), encoding: .utf8)!]], "structuredContent": info, "isError": false]
     }
     private func validateArguments(_ args: [String: Any], tool: String) throws {

@@ -179,6 +179,7 @@ final class EditorAutomation {
     }
 
     func call(_ name: String, arguments: [String: Any]) async throws -> [String: Any] {
+        let arguments = try expandIDs(arguments)
         switch name {
         case "get_capabilities": return response("Editor capabilities", capabilities())
         case "list_documents": return response("Open documents", documentsSummary())
@@ -894,11 +895,13 @@ final class EditorAutomation {
         value["canvas"] = ["width": document.width, "height": document.height, "resolution": document.resolution]
         value["selection"] = s.selection.map { ["empty": $0.isEmpty, "antialiased": $0.antialiased, "feather": $0.feather,
             "bounds": rect($0.path.boundingBoxOfPath)] as [String: Any] } ?? NSNull()
-        value["layers"] = document.layers.reversed().map { layerState($0) }
+        value["layers"] = document.layers.reversed().enumerated().map { layerState($0.element, index: $0.offset) }
         return value
     }
 
-    private func layerState(_ layer: ImageLayer) -> [String: Any] {
+    /// `index` is the top-to-bottom position in the manifest, so pure reorders change layer state
+    /// and reach the agent inside mutation deltas.
+    private func layerState(_ layer: ImageLayer, index: Int? = nil) -> [String: Any] {
         var value: [String: Any] = [
             "id": layer.id.uuidString, "name": layer.name, "visible": layer.isVisible, "group": layer.isGroup,
             "parent_id": layer.parentID?.uuidString ?? NSNull(), "opacity": layer.opacity, "blend_mode": layer.blendMode.rawValue,
@@ -909,6 +912,7 @@ final class EditorAutomation {
             "shape": layer.liveShape?.style.kind.rawValue ?? NSNull(), "text": layer.liveText?.style.content ?? NSNull(),
             "effects": layer.effects.flatMap(jsonObject) ?? NSNull()
         ]
+        if let index { value["index"] = index }
         value["shape_style"] = layer.liveShape.map { jsonObject($0.style) ?? NSNull() } ?? NSNull()
         if let style = layer.liveText?.style { value["text_style"] = ["font_name": style.fontName, "font_size": style.fontSize,
             "alignment": style.alignment.rawValue, "tracking": style.tracking, "leading": style.leading,
@@ -917,17 +921,251 @@ final class EditorAutomation {
     }
 
     private func response(_ text: String, _ structured: [String: Any]) -> [String: Any] {
-        ["content": [["type": "text", "text": text]], "structuredContent": structured]
+        ["content": [["type": "text", "text": text]], "structuredContent": presented(structured)]
     }
 
     func mutate(_ a: [String: Any], _ body: () throws -> String) throws -> [String: Any] {
-        try checkRevision(a); try selectDocumentIfRequested(a); let message = try body(); syncRevision()
-        return response(message, ["revision": revision, "document_id": workspace.selectedID.uuidString, "state": describe(workspace.current)])
+        try checkRevision(a); try selectDocumentIfRequested(a)
+        let before = snapshot()
+        let message = try body()
+        syncRevision()
+        return response(message, mutationResult(from: before))
     }
 
     func mutateAsync(_ a: [String: Any], _ body: () async throws -> String) async throws -> [String: Any] {
-        try checkRevision(a); try selectDocumentIfRequested(a); let message = try await body(); syncRevision()
-        return response(message, ["revision": revision, "document_id": workspace.selectedID.uuidString, "state": describe(workspace.current)])
+        try checkRevision(a); try selectDocumentIfRequested(a)
+        let before = snapshot()
+        let message = try await body()
+        syncRevision()
+        return response(message, mutationResult(from: before))
+    }
+
+    // MARK: - Mutation deltas
+
+    /// One coherent edit answers with a delta in `describe_document` vocabulary so the agent
+    /// patches its own model instead of re-reading whole documents between calls. Diffing the
+    /// described state keeps every operation honest without per-tool delta code.
+    private struct WorkspaceSnapshot {
+        let tabs: Set<UUID>
+        let selected: UUID
+        let state: [String: Any]
+    }
+
+    private func snapshot() -> WorkspaceSnapshot {
+        let tab = workspace.current
+        return WorkspaceSnapshot(tabs: Set(workspace.tabs.map(\.id)), selected: tab.id, state: describe(tab))
+    }
+
+    private func mutationResult(from before: WorkspaceSnapshot) -> [String: Any] {
+        var result: [String: Any] = ["revision": revision, "document_id": workspace.selectedID.uuidString]
+        let after = Set(workspace.tabs.map(\.id))
+        let opened = after.subtracting(before.tabs).map(\.uuidString).sorted()
+        let closed = before.tabs.subtracting(after).map(\.uuidString).sorted()
+        if !opened.isEmpty { result["new_document_ids"] = opened }
+        if !closed.isEmpty { result["closed_document_ids"] = closed }
+        tombstoneRemoved(from: before)
+        if let target = workspace.tabs.first(where: { $0.id == before.selected }) {
+            result["delta"] = Self.delta(before: before.state, after: describe(target))
+        } else {
+            result["delta"] = ["changed": [], "layers": [], "removed_layer_ids": [],
+                "closed_document_ids": [before.selected.uuidString], "note": "The edited document was closed; its layer manifest is gone."]
+        }
+        return result
+    }
+
+    private static let maximumDeltaLayers = 20
+
+    static func delta(before: [String: Any], after: [String: Any]) -> [String: Any] {
+        var changed: [String] = []
+        var sections: [String: Any] = [:]
+        for (key, value) in after where key != "layers" && key != "revision" && key != "document_id" {
+            if !jsonEqual(before[key], value) {
+                changed.append(key)
+                sections[key] = value
+            }
+        }
+        changed.sort()
+        var result = sections
+        result["changed"] = changed
+        result.merge(layerDelta(before: before["layers"], after: after["layers"])) { _, new in new }
+        return result
+    }
+
+    private static func layerDelta(before: Any?, after: Any?) -> [String: Any] {
+        var known: [String: [String: Any]] = [:]
+        for case let state as [String: Any] in (before as? [Any] ?? []) where state["id"] is String {
+            known[state["id"] as! String] = state
+        }
+        var changed: [[String: Any]] = []
+        for case let state as [String: Any] in (after as? [Any] ?? []) {
+            guard let id = state["id"] as? String else { continue }
+            if !jsonEqual(known[id], state) { changed.append(state) }
+        }
+        let afterIDs = Set((after as? [Any] ?? []).compactMap { ($0 as? [String: Any])?["id"] as? String })
+        let removed = known.keys.filter { !afterIDs.contains($0) }.sorted()
+        var result: [String: Any] = ["layers": changed, "removed_layer_ids": removed]
+        if changed.count > maximumDeltaLayers {
+            let overflow = changed.count - maximumDeltaLayers
+            result["layers"] = Array(changed.prefix(maximumDeltaLayers))
+            result["layers_note"] = "\(overflow) more changed layers omitted; read describe_document for the full manifest."
+        }
+        return result
+    }
+
+    private static func jsonEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil): return true
+        case (let lhs?, let rhs?): return canonicalJSON(lhs) == canonicalJSON(rhs)
+        default: return false
+        }
+    }
+
+    private static func canonicalJSON(_ value: Any) -> Data {
+        let wrapped = (value is [Any] || value is [String: Any]) ? value : [value]
+        return (try? JSONSerialization.data(withJSONObject: wrapped, options: [.sortedKeys])) ?? Data()
+    }
+
+    // MARK: - Short ids
+
+    /// Entity ids leave as the shortest unique prefix of at least eight characters and come back as
+    /// any unambiguous prefix of at least four, so payloads stay small on large documents and the
+    /// agent never has to echo 36-character UUIDs.
+    private static let minimumShortID = 8
+    private static let minimumShortIDPrefix = 4
+    private static let idKeys: Set<String> = ["id", "document_id", "selected_document_id", "active_layer_id",
+        "layer_id", "layer_ids", "parent_id", "above_id", "source_id", "mask_source_id", "selected_layer_ids",
+        "guide_id", "new_document_ids", "closed_document_ids", "removed_layer_ids"]
+
+    /// Every id an agent can name: tabs, layers (including groups and adjustment layers) and guides,
+    /// plus ids removed by recent mutations so deltas report deletions with the same short form the
+    /// agent has been using.
+    func knownIDs() -> [UUID] {
+        var ids: [UUID] = workspace.tabs.map(\.id)
+        for tab in workspace.tabs {
+            guard let document = tab.session.document else { continue }
+            ids += document.layers.map(\.id)
+            ids += document.guides.map(\.id)
+        }
+        return ids + tombstones
+    }
+
+    /// Layers, guides and tabs a mutation just removed stay addressable briefly: the delta names
+    /// them, and echoing one back should fail as "unknown layer", not "unknown id".
+    private var tombstones: [UUID] = []
+
+    private func tombstoneRemoved(from before: WorkspaceSnapshot) {
+        var candidates = before.tabs
+        collectIDs(before.state, into: &candidates)
+        let living = Set(knownIDs())
+        tombstones += candidates.subtracting(living)
+        if tombstones.count > 512 { tombstones.removeFirst(tombstones.count - 512) }
+    }
+
+    private func collectIDs(_ value: Any, into ids: inout Set<UUID>) {
+        switch value {
+        case let object as [String: Any]:
+            for (key, child) in object {
+                if Self.idKeys.contains(key) {
+                    switch child {
+                    case let string as String: if let id = UUID(uuidString: string) { ids.insert(id) }
+                    case let array as [Any]:
+                        for case let string as String in array { if let id = UUID(uuidString: string) { ids.insert(id) } }
+                    default: break
+                    }
+                } else {
+                    collectIDs(child, into: &ids)
+                }
+            }
+        case let array as [Any]:
+            for child in array { collectIDs(child, into: &ids) }
+        default: break
+        }
+    }
+
+    func resolve(_ value: Any) throws -> UUID {
+        guard let text = value as? String, !text.isEmpty else { throw invalid("Expected an id string.") }
+        if let id = UUID(uuidString: text) { return id }
+        let prefix = text.uppercased()
+        guard prefix.count >= Self.minimumShortIDPrefix else { throw invalid("Id prefixes need at least \(Self.minimumShortIDPrefix) characters.") }
+        let matches = knownIDs().filter { $0.uuidString.hasPrefix(prefix) }
+        guard let id = matches.first else { throw invalid("Unknown id \(text).") }
+        guard matches.count == 1 else { throw invalid("Ambiguous id prefix \(text); use more characters.") }
+        return id
+    }
+
+    func shortID(_ id: UUID) -> String {
+        shortIDTable()[id.uuidString] ?? id.uuidString
+    }
+
+    /// Expands short id prefixes in id-bearing argument keys before any tool decodes them.
+    /// Unknown or ambiguous prefixes fail here, before anything mutates.
+    func expandIDs(_ arguments: [String: Any]) throws -> [String: Any] {
+        try expanded(arguments) as? [String: Any] ?? arguments
+    }
+
+    private func expanded(_ value: Any) throws -> Any {
+        switch value {
+        case let object as [String: Any]:
+            var result: [String: Any] = [:]
+            for (key, child) in object {
+                result[key] = Self.idKeys.contains(key) ? try resolvedValue(child) : try expanded(child)
+            }
+            return result
+        case let array as [Any]:
+            return try array.map { try expanded($0) }
+        default:
+            return value
+        }
+    }
+
+    private func resolvedValue(_ value: Any) throws -> Any {
+        if let string = value as? String { return try resolve(string).uuidString }
+        if let array = value as? [Any] { return try array.map { try resolvedValue($0) } }
+        return value
+    }
+
+    /// Replaces entity ids under id-bearing keys with their short prefixes.
+    func presented(_ structured: [String: Any]) -> [String: Any] {
+        shorten(structured, table: shortIDTable()) as? [String: Any] ?? structured
+    }
+
+    private func shortIDTable() -> [String: String] {
+        let ids = knownIDs().map(\.uuidString).sorted()
+        var table: [String: String] = [:]
+        for (index, id) in ids.enumerated() {
+            var length = Self.minimumShortID
+            for offset in [index - 1, index + 1] where ids.indices.contains(offset) {
+                let neighbor = Array(ids[offset]), own = Array(id)
+                var common = 0
+                while common < own.count, common < neighbor.count, own[common] == neighbor[common] { common += 1 }
+                length = max(length, min(common + 1, id.count))
+            }
+            table[id] = String(id.prefix(length))
+        }
+        return table
+    }
+
+    private func shorten(_ value: Any, table: [String: String]) -> Any {
+        switch value {
+        case let object as [String: Any]:
+            var result: [String: Any] = [:]
+            for (key, child) in object {
+                result[key] = Self.idKeys.contains(key) ? Self.mapped(child, table: table) : shorten(child, table: table)
+            }
+            return result
+        case let array as [Any]:
+            return array.map { shorten($0, table: table) }
+        default:
+            return value
+        }
+    }
+
+    private static func mapped(_ value: Any, table: [String: String]) -> Any {
+        if let string = value as? String { return table[string] ?? string }
+        if let array = value as? [Any] {
+            return array.map { ($0 as? String).map { table[$0] ?? $0 } ?? $0 }
+        }
+        return value
     }
 
     func checkRevision(_ a: [String: Any]) throws {
@@ -1021,8 +1259,9 @@ final class EditorAutomation {
 
     private func requiredLayerID(_ a: [String: Any]) throws -> UUID { let id = try uuid(a["layer_id"]); _ = try layer(id); return id }
     private func uuid(_ value: Any) throws -> UUID {
-        guard let string = value as? String, let id = UUID(uuidString: string) else { throw invalid("Expected a UUID string.") }
-        return id
+        guard let string = value as? String else { throw invalid("Expected a UUID string.") }
+        if let id = UUID(uuidString: string) { return id }
+        return try resolve(string)
     }
     private func uuid(_ value: Any?) throws -> UUID { guard let value else { throw invalid("Missing UUID.") }; return try uuid(value) }
     private func optionalUUID(_ value: Any?) throws -> UUID? { guard let value, !(value is NSNull) else { return nil }; return try uuid(value) }
