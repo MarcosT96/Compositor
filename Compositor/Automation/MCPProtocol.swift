@@ -38,7 +38,7 @@ final class MCPRouter {
               "inputSchema": ["type": "object", "additionalProperties": false,
                 "properties": ["id": ["type": "string", "maxLength": 64]], "required": ["id"]],
               "annotations": ["readOnlyHint": true, "destructiveHint": false, "openWorldHint": false]],
-            ["name": "manage_skills", "description": "List, create, update, or remove editing skills stored in ~/.compositor/skills. create and update take complete SKILL.md markdown: a frontmatter with name and description, then a workflow body. Use list before offering to teach the user a new skill.",
+            ["name": "manage_skills", "description": "List, create, update, or remove editing skills stored in the app's skills folder. create and update take complete SKILL.md markdown: a frontmatter with name and description, then a workflow body. Use list before offering to teach the user a new skill.",
               "inputSchema": ["type": "object", "additionalProperties": false,
                 "properties": ["action": ["type": "string", "enum": ["list", "create", "update", "remove"]],
                   "id": ["type": "string", "maxLength": 64],
@@ -123,7 +123,7 @@ final class MCPRouter {
                 guard let uri = params["uri"] as? String else { throw RPCError.invalidParams("uri is required") }
                 let value: String
                 if uri == "compositor://guide" {
-                    value = "Compositor live editing: list_documents returns stable tab IDs; pass document_id to tools. describe_document exposes the complete layer manifest. Mutation tools answer with a delta in describe_document vocabulary: patch your model from it instead of re-reading. Ids are short unique prefixes; any longer prefix or full UUID also matches. Edits use native history. A busy human session or another request is rejected. All coordinates are document pixels, with origin at top left. Import images as base64 data for sandbox-safe access. Skills are markdown editing recipes stored in ~/.compositor/skills; read_skill loads one before a multi-step edit. HTML import accepts self-contained markup/styles, supports embedded data assets, disables author scripts and external resources, and reports raster fallbacks. Complex browser effects cannot always become native editable layers. Imported HTML source is available for this app session at compositor://html/{document_id}. Save your .comp to preserve the editable document. Disable Agent Connection in the app menu to revoke all clients."
+                    value = "Compositor live editing: list_documents returns stable tab IDs; pass document_id to tools. describe_document exposes the complete layer manifest. Mutation tools answer with a delta in describe_document vocabulary: patch your model from it instead of re-reading. Ids are short unique prefixes; any longer prefix or full UUID also matches. Edits use native history. A busy human session or another request is rejected. All coordinates are document pixels, with origin at top left. Import images as base64 data for sandbox-safe access. Skills are markdown editing recipes stored in the app's skills folder (see docs/mcp.md); read_skill loads one before a multi-step edit. HTML import accepts self-contained markup/styles, supports embedded data assets, disables author scripts and external resources, and reports raster fallbacks. Complex browser effects cannot always become native editable layers. Imported HTML source is available for this app session at compositor://html/{document_id}. Save your .comp to preserve the editable document. Disable Agent Connection in the app menu to revoke all clients."
                 } else if uri.hasPrefix("compositor://documents/"),
                           let uuid = try? editor.resolve(String(uri.dropFirst("compositor://documents/".count))),
                           workspace.tabs.contains(where: { $0.id == uuid }) {
@@ -177,7 +177,7 @@ final class MCPRouter {
     private func skillsSection() -> String {
         guard let installed = try? skills.index(), !installed.isEmpty else { return "" }
         let lines = installed.prefix(20).map { "\($0.id): \($0.description)" }.joined(separator: "\n")
-        return "\n\nSkills are markdown editing recipes stored in ~/.compositor/skills. read_skill(id) loads one before a multi-step edit; manage_skills lists, creates, updates, and removes them. Installed skills:\n\(lines)"
+        return "\n\nSkills are markdown editing recipes stored in the app's skills folder. read_skill(id) loads one before a multi-step edit; manage_skills lists, creates, updates, and removes them. Installed skills:\n\(lines)"
     }
 
     // MARK: - Image generation

@@ -33,7 +33,7 @@ Edits use the app's native undo history. Tools report validation and execution f
 
 ## Skills
 
-Skills are markdown editing recipes stored in `~/.compositor/skills/<id>/SKILL.md`. `initialize` lists installed skills in the server instructions so a matching recipe is found before one is improvised; `read_skill` loads one in full, and `manage_skills` lists, creates, updates and removes them. A skill is a `name` (80 characters) and `description` (1024 characters) frontmatter followed by workflow prose: it suggests tool calls but cannot execute anything by itself.
+Skills are markdown editing recipes stored in `~/Library/Containers/com.wonderassembly.compositor/Data/Library/Application Support/Compositor/skills/<id>/SKILL.md` — inside the app's sandbox container, next to `automation.json`. Installing one is easiest with `manage_skills` `action: "create"`; the folder is also reachable from Finder with **Ir a carpeta** (`⇧⌘G`). `initialize` lists installed skills in the server instructions so a matching recipe is found before one is improvised; `read_skill` loads one in full, and `manage_skills` lists, creates, updates and removes them. A skill is a `name` (80 characters) and `description` (1024 characters) frontmatter followed by workflow prose: it suggests tool calls but cannot execute anything by itself.
 
 Three complete [example skills](examples/skills) ship with this document — `skin-retouch`, `product-composite` and `film-look`. Copy their folders into `~/.compositor/skills/`, or have the agent install one with `manage_skills` `action: "create"`.
 

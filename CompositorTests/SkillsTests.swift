@@ -46,6 +46,12 @@ struct SkillsTests {
         #expect(throws: SkillError.self) { try store.skill(id: "skin-retouch") }
     }
 
+    @Test func defaultDirectoryLandsInApplicationSupport() {
+        // A sandboxed app resolves its home to the container; skills must live where it can
+        // actually read them, beside automation.json — not in the user's real ~/.compositor.
+        #expect(SkillStore.defaultDirectory.path.hasSuffix("Application Support/Compositor/skills"))
+    }
+
     @Test func routerExposesSkillToolsAndInstructions() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

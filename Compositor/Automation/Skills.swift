@@ -75,8 +75,12 @@ enum SkillParser {
 final class SkillStore {
     let directory: URL
 
+    /// Sandbox-safe location: a sandboxed app resolves its home to the container, so skills live
+    /// beside `automation.json` in Application Support. `manage_skills` installs them there without
+    /// any manual file work; a Finder shortcut is `Ir a carpeta` with the path in docs/mcp.md.
     nonisolated static var defaultDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".compositor/skills", isDirectory: true)
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Compositor/skills", isDirectory: true)
     }
 
     init(directory: URL = SkillStore.defaultDirectory) {
